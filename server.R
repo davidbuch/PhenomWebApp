@@ -8,12 +8,15 @@
 #
 
 library(shiny)
+source("create_design.R")
 
 loadMetaFile <- function(inFile){
   if (is.null(inFile))
     return(NULL)
   
-  read.csv(inFile$datapath)
+  meta <- read.csv(inFile$datapath)
+  meta[] <- lapply(meta, factor) # convert all variables to factors before returning
+  meta
 }
 
 loadOdFile <- function(inFile){
@@ -23,47 +26,15 @@ loadOdFile <- function(inFile){
   read.csv(inFile$datapath, row.names = 1)
 }
 
-createStanData <- function(od, meta, model_params){
-  L <- 1 # number of priors
-  K <- nlevels(factor(meta[,1])) # number of functions
-  priors <- rep(1,K) # prior assignment for each functional coefficient
-  maxExpectedCross <- 100
-  minExpectedCross <- 0.01
-  
-  ls_min <- 1/(pi*maxExpectedCross)
-  ls_max <- 1/(pi*minExpectedCross)
-  
-  x <- as.numeric(row.names(od))
-  y <- as.matrix(od)
-  dm <- model.matrix(~factor(meta[,1]) - 1)
-  
-  stan_data <- list(
-    N = length(x), # number of timepoints
-    P = ncol(y), # number of observations
-    design = dm, # design matrix
-    x = x, # observation times
-    y = t(y), # each row is one well's time series of OD measurements
-    K = K,
-    L = L,
-    prior = rep(1,K), # prior assignment for each functional coefficient
-    alpha_prior = matrix(1, nrow = L, ncol = 2),
-    lengthscale_prior = matrix(1, nrow = L, ncol = 2),
-    sigma_prior = c(1,1),
-    ls_min = 1/(pi*100), # equiv. to "maxExpectedCross = 100"
-    ls_max = 1/(pi*0.01) # equiv. to "minExpectedCross = 0.01"
-  )
-  return(stan_data)
-}
-
 shinyServer(function(input, output) {
-  od <- eventReactive(input$OdData,{
-    loadOdFile(input$OdData)
+  od <- eventReactive(input$odData,{
+    loadOdFile(input$odData)
   })
-  meta <- eventReactive(input$MetaData,{
-    loadMetaFile(input$MetaData)
+  meta <- eventReactive(input$metaData,{
+    loadMetaFile(input$metaData)
   })
 
-  output$OdDataPlot <- renderPlot({
+  output$odDataPlot <- renderPlot({
     req(od())
     od <- od()
     matplot(as.numeric(row.names(od)), od, 
@@ -72,65 +43,87 @@ shinyServer(function(input, output) {
             ylab = "Optical Density",
             main = "Observed Data")
   })
-  output$MetaDataFrame <- renderTable({
+  output$metaDataFrame <- renderTable({
     meta()
   })
   
-  output$FitModelButton <- renderUI({
+  output$fitModelButton <- renderUI({
     req(od())
     req(meta())
     actionButton("run", "Fit Model")
   })
   
-  res <- eventReactive(input$run, {
+  model_fit <- eventReactive(input$run, {
     od <- od()
     meta <- meta()
+
     validate(
-      need(ncol(od()) == nrow(meta()), "Columns of Optical Density data must match rows of meta data.")
+      need(ncol(od()) == nrow(meta()), "Columns of optical density data must match rows of meta data.")
     )
-    
-    model_params <- NULL
-    sampling_params <- NULL
-    if(is.null(sampling_params)){
-      sampling_params <- list(chains = 2, iter = 1000)
+
+    if(input$modelSelect %in% c("MBATCH", "MFULL")){
+      validate(
+        need('BATCH' %in% names(meta), "MBATCH/MFULL selected but no 'BATCH' column detected in meta data.")
+      )
     }
+
     
-    stan_data <- createStanData(od, meta, model_params)
+    # Identify the names of all treatment columns
+    # Currently, we are assuming this includes all columns that aren't called
+    # 'BATCH' or 'REPLICATE', which we reserve as keywords
+    covariate_set <- names(meta)[!(names(meta) %in% c('BATCH', 'REPLICATE'))]
+
+    model_params <- list(alpha_prior = c(input$alphaPriorShape,input$alphaPriorRate),
+                         lengthscale_prior = c(input$lengthscalePriorShape,input$lengthscalePriorRate),
+                         sigma_prior = c(input$sigmaPriorShape,input$sigmaPriorRate),
+                         minExpectedCross = input$minZeroCrossings,
+                         maxExpectedCross = input$maxZeroCrossings,
+                         marginal_alpha_prior = c(input$marginalAlphaPriorShape,input$marginalAlphaPriorRate),
+                         marginal_lengthscale_prior = c(input$marginalLengthscalePriorShape,input$marginalLengthscalePriorRate))
     
-    # attach sampling_params for stan call
+    stan_data <- createStanData(od, meta, model_params, input$modelSelect)
+    
+    # MFULL uses the "phenom_marginal" stanmodel object
+    # MNULL/MBATCH use "phenom_deriv"
+    if(input$modelSelect == "MFULL"){
+      stan_model <- PhenomStanModel:::stanmodels$phenom_marginal
+    }else{
+      stan_model <- PhenomStanModel:::stanmodels$phenom_deriv
+    }
+
     shinybusy::show_spinner() # Indicate that we are busy sampling
-    attach(sampling_params)
     stan_fit <- rstan::sampling(
-      object = PhenomStanModel:::stanmodels$phenom_deriv,
+      object = stan_model,
       data = stan_data,
-      chains = chains,
-      iter = iter
+      chains = round(input$chains),
+      iter = round(input$iter),
+      warmup = round(input$warmup),
+      thin = round(input$thin)
     )
-    detach(sampling_params)
     shinybusy::hide_spinner() # Indicate that we are done sampling
     
     summary(stan_fit)$summary[,c(4,6,8:10)]
   }, ignoreNULL = TRUE)
   
-  output$FitSummary <- renderTable({
-    if (is.null(res()))
+  output$fitSummary <- renderTable({
+    if (is.null(model_fit()))
       return(NULL)
     else
-      return(res())
+      return(model_fit())
   })
 
-  output$DownloadButton <- renderUI({
-    req(res()) # requires result to be non-null before showing button
+  output$downloadButton <- renderUI({
+    req(model_fit()) # requires result to be non-null before showing button
     downloadButton('Download',"Download Model Fit Summary")
   })
   
-  output$Download <- downloadHandler(
+  output$download <- downloadHandler(
     filename = function(){paste0("phenom_", format(Sys.time(),"%d_%m_%Y__%H_%M_%S"), ".csv")},
     content = function(fname){
-      if(is.null(res())){
+      if(is.null(model_fit())){
         write.csv(NULL,fname)
       }else{
-        write.csv(res(),fname)
+        write.csv(model_fit(),fname)
       }
     },
     contentType = "text/csv"
