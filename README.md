@@ -8,8 +8,12 @@ If you would like to run this Shiny app locally, you can do so using RStudio.
 Before getting started, you first need to install the app's helper package ```PhenomStanModel```.
 To install that package, try running 
 ```devtools::install_github("davidbuch/PhenomStanModel")```
-from an instance of R. If that doens't work, you may need to first install the devtools package from CRAN.
-```install.packages("devtools")```.
+in the command console of RStudio. 
+
+If that doens't work, you may need to first install the devtools package from CRAN.
+To install ```devtools``` you simply need to enter
+```install.packages("devtools")```
+in the command console.
 
 All other dependencies for this app are available on CRAN, and RStudio should prompt you to install these packages if you have not installed them already.
 
