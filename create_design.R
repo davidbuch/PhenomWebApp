@@ -75,18 +75,18 @@ get_priors <- function(level_counts){
 }
 
 
-createStanData <- function(od, meta, model_params, model_type){
-  # Identify the names of all treatment columns
+createStanData <- function(od, meta, model_params, add_batch){
+  # Identify the names of all treatment columns.
   # Currently, we are assuming this includes all columns that aren't called
-  # 'BATCH' or 'REPLICATE', which we reserve as keywords
-  covariates <- meta[!(names(meta) %in% c('BATCH', 'REPLICATE'))]
+  # 'BATCH', which is reserved as a keyword
+  covariates <- meta[names(meta) != 'BATCH']
   covariates <- sapply(covariates, as.integer)
   colnames(covariates) <- NULL
   
   level_counts <- apply(covariates, 2, max)
   priors <- get_priors(level_counts)
   design <- t(apply(covariates, 1, function(r) get_design(r,level_counts)))
-  if(model_type %in% c("MBATCH", "MFULL")){
+  if(add_batch){
     batch <- as.integer(meta$BATCH)
     nbatch <- max(batch)
     priors <- add_batch_to_priors(priors, nbatch)

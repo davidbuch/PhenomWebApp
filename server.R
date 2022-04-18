@@ -9,6 +9,7 @@
 
 library(shiny)
 source("create_design.R")
+source("process_model_fit.R")
 
 loadMetaFile <- function(inFile){
   if (is.null(inFile))
@@ -16,6 +17,25 @@ loadMetaFile <- function(inFile){
   
   meta <- read.csv(inFile$datapath)
   meta[] <- lapply(meta, factor) # convert all variables to factors before returning
+  
+  # Validation:
+  # for each possible treatment condition, was there at least one replicate that 
+  # received it?
+  covariates <- meta[names(meta) != 'BATCH']
+  treatments <- do.call(expand.grid,lapply(covariates,levels))
+  tried_all_treatments <- all(apply(treatments,1, 
+                                    function(treatment) 
+                                      any(apply(covariates,1, 
+                                                function(covs) 
+                                                  all(covs == treatment)))))
+  validate(
+    need(tried_all_treatments, "All possible covariate combinations must be present 
+        in your meta-data to fit the model. Add replicates collected under those
+        missing experimental conditions or remove covariates from your model."),
+    need(min(sapply(meta, nlevels)) >= 2, "Any column included in the meta-data 
+         file (including 'BATCH', if it is used) must feature at least 2 treatment 
+         levels.")
+  )
   meta
 }
 
@@ -23,10 +43,22 @@ loadOdFile <- function(inFile){
   if (is.null(inFile))
     return(NULL)
   
-  read.csv(inFile$datapath, row.names = 1)
+  od <- read.csv(inFile$datapath, row.names = 1)
+  validate(
+    need(nrow(od) <= 15, "Please subsample Optical Density time-series to include
+         at most 15 timepoints. Ten or fewer would be ideal."),
+    need(nrow(od) >= 2, "Optical Density time-series must include
+         at least 2 timepoints. Ten or fewer would be ideal.")
+  )
+  od
 }
 
 shinyServer(function(input, output) {
+  output$clock <- renderText({
+    invalidateLater(5000)
+    Sys.time()
+  }) # keep the app from "greying out" on shinyapps.io (connection stops when inactive)
+  
   od <- eventReactive(input$odData,{
     loadOdFile(input$odData)
   })
@@ -61,60 +93,44 @@ shinyServer(function(input, output) {
       need(ncol(od()) == nrow(meta()), "Columns of optical density data must match rows of meta data.")
     )
 
-    if(input$modelSelect %in% c("MBATCH", "MFULL")){
-      validate(
-        need('BATCH' %in% names(meta), "MBATCH/MFULL selected but no 'BATCH' column detected in meta data.")
-      )
+    if(!('BATCH' %in% names(meta))){
+      warning("No 'BATCH' column detected in meta data.")
     }
-
     
-    # Identify the names of all treatment columns
-    # Currently, we are assuming this includes all columns that aren't called
-    # 'BATCH' or 'REPLICATE', which we reserve as keywords
-    covariate_set <- names(meta)[!(names(meta) %in% c('BATCH', 'REPLICATE'))]
-
-    model_params <- list(alpha_prior = c(input$alphaPriorShape,input$alphaPriorRate),
-                         lengthscale_prior = c(input$lengthscalePriorShape,input$lengthscalePriorRate),
-                         sigma_prior = c(input$sigmaPriorShape,input$sigmaPriorRate),
-                         minExpectedCross = input$minZeroCrossings,
-                         maxExpectedCross = input$maxZeroCrossings,
-                         marginal_alpha_prior = c(input$marginalAlphaPriorShape,input$marginalAlphaPriorRate),
-                         marginal_lengthscale_prior = c(input$marginalLengthscalePriorShape,input$marginalLengthscalePriorRate))
+    model_params <- list(alpha_prior = c(1,1),
+                         lengthscale_prior = c(1,1),
+                         sigma_prior = c(1,1),
+                         minExpectedCross = 0.01,
+                         maxExpectedCross = 100,
+                         marginal_alpha_prior = c(1,1),
+                         marginal_lengthscale_prior = c(1,1))
     
-    stan_data <- createStanData(od, meta, model_params, input$modelSelect)
+    sampling_params <- list(chains = round(2),
+                            iter = round(1000),
+                            warmup = round(500),
+                            thin = round(1))
     
-    # MFULL uses the "phenom_marginal" stanmodel object
-    # MNULL/MBATCH use "phenom_deriv"
-    if(input$modelSelect == "MFULL"){
-      stan_model <- PhenomStanModel:::stanmodels$phenom_marginal
-    }else{
-      stan_model <- PhenomStanModel:::stanmodels$phenom_deriv
-    }
-
+    # Don't add columns for batch-specific random effects if there's no BATCH column
+    stan_data <- createStanData(od, meta, model_params, 'BATCH' %in% names(meta))
+   
     shinybusy::show_spinner() # Indicate that we are busy sampling
     stan_fit <- rstan::sampling(
-      object = stan_model,
+      object = PhenomStanModel:::stanmodels$phenom_marginal,
       data = stan_data,
-      chains = round(input$chains),
-      iter = round(input$iter),
-      warmup = round(input$warmup),
-      thin = round(input$thin)
+      chains = sampling_params$chains,
+      iter = sampling_params$iter,
+      warmup = sampling_params$warmup,
+      thin = sampling_params$thin
     )
     shinybusy::hide_spinner() # Indicate that we are done sampling
     
-    summary(stan_fit)$summary[,c(4,6,8:10)]
+    growth_curve_summary <- get_function_summary(stan_fit, meta)
+    growth_curve_summary
   }, ignoreNULL = TRUE)
-  
-  output$fitSummary <- renderTable({
-    if (is.null(model_fit()))
-      return(NULL)
-    else
-      return(model_fit())
-  })
 
   output$downloadButton <- renderUI({
     req(model_fit()) # requires result to be non-null before showing button
-    downloadButton('Download',"Download Model Fit Summary")
+    downloadButton('download',"Download Model Fit Summary")
   })
   
   output$download <- downloadHandler(
